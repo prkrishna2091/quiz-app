@@ -4,6 +4,9 @@ import com.codapt.quizapp.dto.YoutubeCaptionDetails;
 import com.codapt.quizapp.service.YoutubeCaptionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.thoroldvix.api.TranscriptContent;
+import io.github.thoroldvix.api.TranscriptApiFactory;
+import io.github.thoroldvix.api.YoutubeTranscriptApi;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
@@ -15,7 +18,9 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.URL;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 
 
 @Service
@@ -78,18 +83,39 @@ public class YoutubeCaptionServiceImpl implements YoutubeCaptionService {
 
         JsonNode subtitles = root.path("subtitles").path("en");
         String subtitleUrl = null;
-        if (subtitles.isArray() && subtitles.size() > 0) {
+        if (subtitles.isArray() && !subtitles.isEmpty()) {
             subtitleUrl = subtitles.get(0).path("url").asText();
         }
 
-        if (subtitleUrl == null || subtitleUrl.isEmpty()) {
-            JsonNode autoCaptions = root.path("automatic_captions").path("en");
-            if (autoCaptions.isArray() && autoCaptions.size() > 0) {
-                subtitleUrl = autoCaptions.get(0).path("url").asText();
-            }
-        }
+        String cleanedCaptions = null;
 
         if (subtitleUrl == null || subtitleUrl.isEmpty()) {
+            String videoId = extractYoutubeVideoId(youtubeUrl);
+            if (videoId != null && !videoId.isEmpty()) {
+                YoutubeTranscriptApi youtubeTranscriptApi = TranscriptApiFactory.createDefault();
+                TranscriptContent transcriptContent = youtubeTranscriptApi.getTranscript(videoId, "en");
+                cleanedCaptions = buildCaptionsFromTranscript(transcriptContent);
+                logger.info("Fetched transcript fallback using video id: {}", videoId);
+            } else {
+                logger.warn("Could not extract video id from URL: {}", youtubeUrl);
+            }
+        } else {
+            logger.info("Captions found, downloading from: {}", subtitleUrl);
+
+            StringBuilder captions = new StringBuilder();
+            try (BufferedReader subtitleReader = new BufferedReader(
+                    new InputStreamReader(URI.create(subtitleUrl).toURL().openStream()))) {
+                String line;
+                while ((line = subtitleReader.readLine()) != null) {
+                    captions.append(line).append("\n");
+                }
+            }
+
+            logger.info("Captions downloaded successfully for video: {}", youtubeUrl);
+            cleanedCaptions = cleanCaptionText(captions.toString());
+        }
+
+        if (cleanedCaptions == null || cleanedCaptions.isBlank()) {
             logger.warn("No captions found for video: {}", youtubeUrl);
             return new YoutubeCaptionDetails(
                     "No captions available for this video",
@@ -99,25 +125,96 @@ public class YoutubeCaptionServiceImpl implements YoutubeCaptionService {
             );
         }
 
-        logger.info("Captions found, downloading from: {}", subtitleUrl);
+        return new YoutubeCaptionDetails(cleanedCaptions, videoTitle, channelName, videoLength);
+    }
 
-        StringBuilder captions = new StringBuilder();
-        try (BufferedReader subtitleReader = new BufferedReader(new InputStreamReader(new URL(subtitleUrl).openStream()))) {
-            String line;
-            while ((line = subtitleReader.readLine()) != null) {
-                captions.append(line).append("\n");
+    private String buildCaptionsFromTranscript(TranscriptContent transcriptContent) {
+        if (transcriptContent == null || transcriptContent.getContent() == null || transcriptContent.getContent().isEmpty()) {
+            return null;
+        }
+
+        StringBuilder transcript = new StringBuilder();
+        for (TranscriptContent.Fragment fragment : transcriptContent.getContent()) {
+            if (fragment != null && fragment.getText() != null && !fragment.getText().isBlank()) {
+                transcript.append(fragment.getText().trim()).append("\n");
             }
         }
 
-        logger.info("Captions downloaded successfully for video: {}", youtubeUrl);
+        String text = transcript.toString().trim();
+        return text.isEmpty() ? null : text;
+    }
 
-        String cleanedCaptions = captions.toString()
-                .replaceAll("WEBVTT", "")
+    private String cleanCaptionText(String captionText) {
+        if (captionText == null) {
+            return null;
+        }
+
+        return captionText
+                .replace("WEBVTT", "")
                 .replaceAll("\\d{2}:\\d{2}:\\d{2}\\.\\d+ --> .*", "")
-                .replaceAll("<.*?>", "")
+                .replaceAll("<[^>]*+>", "")
                 .trim();
+    }
 
-        return new YoutubeCaptionDetails(cleanedCaptions, videoTitle, channelName, videoLength);
+    private String extractYoutubeVideoId(String youtubeUrl) {
+        if (youtubeUrl == null || youtubeUrl.trim().isEmpty()) {
+            return null;
+        }
+
+        try {
+            URI uri = URI.create(youtubeUrl.trim());
+            String host = uri.getHost() == null ? "" : uri.getHost().toLowerCase();
+            String path = uri.getPath() == null ? "" : uri.getPath();
+
+            if (host.contains("youtu.be")) {
+                return sanitizeVideoId(path.startsWith("/") ? path.substring(1) : path);
+            }
+
+            if (path.startsWith("/watch")) {
+                String query = uri.getRawQuery();
+                if (query != null) {
+                    for (String param : query.split("&")) {
+                        String[] parts = param.split("=", 2);
+                        if (parts.length == 2 && "v".equals(parts[0])) {
+                            String value = URLDecoder.decode(parts[1], StandardCharsets.UTF_8);
+                            return sanitizeVideoId(value);
+                        }
+                    }
+                }
+            }
+
+            if (path.startsWith("/shorts/") || path.startsWith("/embed/") || path.startsWith("/v/")) {
+                String[] segments = path.split("/");
+                for (int i = 0; i < segments.length - 1; i++) {
+                    if ("shorts".equals(segments[i]) || "embed".equals(segments[i]) || "v".equals(segments[i])) {
+                        return sanitizeVideoId(segments[i + 1]);
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            logger.warn("Failed to parse YouTube URL for video id: {}", youtubeUrl, ex);
+        }
+
+        return null;
+    }
+
+    private String sanitizeVideoId(String candidate) {
+        if (candidate == null) {
+            return null;
+        }
+
+        String id = candidate.trim();
+        int queryIndex = id.indexOf('?');
+        if (queryIndex >= 0) {
+            id = id.substring(0, queryIndex);
+        }
+
+        int fragmentIndex = id.indexOf('#');
+        if (fragmentIndex >= 0) {
+            id = id.substring(0, fragmentIndex);
+        }
+
+        return id.isEmpty() ? null : id;
     }
 
     private String formatDuration(long durationSeconds) {
